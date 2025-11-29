@@ -15,6 +15,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters.state import StateFilter
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 
 # ====== SOZLAMALAR ======
 # Bot token (safely provided by user). Do NOT share this token publicly.
@@ -31,6 +33,20 @@ if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
 # ====== Bot va dispatcher ======
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
+
+# Configure logging to file for better diagnostics
+LOG_PATH = os.path.join(os.path.dirname(__file__), "bot_debug.log")
+logger = logging.getLogger()
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    fh = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding='utf-8')
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    # also keep console handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
 
 # ====== FSM holatlari ======
 class AddAdStates(StatesGroup):
@@ -143,6 +159,14 @@ async def get_groups():
         rows = await cur.fetchall()
         return rows
 
+
+async def delete_group(group_id: int):
+    """Delete a group and any ad_group links referencing it."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+        await db.execute("DELETE FROM ad_groups WHERE group_id = ?", (group_id,))
+        await db.commit()
+
 async def add_ad(section_id: int, admin_id: int, text_content: str, media_file_id: str, media_type: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("INSERT INTO ads (section_id, admin_id, text_content, media_file_id, media_type, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -168,9 +192,10 @@ async def get_all_user_ids():
 def admin_main_kb():
     kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔸 Reklama qo'shish"), KeyboardButton(text="🗂 Bo'limlarni boshqarish")],
-            [KeyboardButton(text="➕ Guruh qo'shish"), KeyboardButton(text="📋 Guruhlar ro'yxati")],
-            [KeyboardButton(text="🔙 Chiqish")]
+            [KeyboardButton(text="/addad"), KeyboardButton(text="/sections")],
+            [KeyboardButton(text="/addgroup"), KeyboardButton(text="/groupslist")],
+            [KeyboardButton(text="/delgroup"), KeyboardButton(text="/exit")],
+            
         ], resize_keyboard=True
     )
     return kb
@@ -206,6 +231,97 @@ async def cmd_start(message: types.Message):
             pass
 
 
+@dp.message(Command(commands=["addad"]))
+async def admin_add_ad_command(message: types.Message, state: FSMContext):
+    """Wrapper so that /addad command triggers the same flow as the keyboard button."""
+    import logging
+    logging.info("/addad command handler invoked by %s (%s)", message.from_user.id, message.from_user.full_name)
+    try:
+        await message.reply("Reklama qo'shish jarayoni boshlandi...")
+        await admin_add_ad_start(message, state)
+    except Exception as e:
+        logging.exception("Error while starting add ad flow")
+        try:
+            await message.reply("Xatolik yuz berdi: 'addad' bosilganda. Iltimos, administratorga murojaat qiling.")
+        except Exception:
+            pass
+
+
+@dp.message(F.text == "/addad")
+async def admin_add_ad_via_text(message: types.Message, state: FSMContext):
+    """Handle cases where reply keyboard sends the text '/addad' instead of a command."""
+    import logging
+    logging.info("/addad text handler invoked by %s (%s): %s", message.from_user.id, message.from_user.full_name, message.text)
+    try:
+        await message.reply("Reklama qo'shish jarayoni boshlandi...")
+        await admin_add_ad_start(message, state)
+    except Exception:
+        logging.exception("Error in admin_add_ad_via_text")
+        try:
+            await message.reply("Xatolik yuz berdi: addad.")
+        except Exception:
+            pass
+
+
+# Fallback: catch any message that starts with "/addad" (robust against extra spaces/caps)
+@dp.message(lambda message: bool(message.text and message.text.strip().lower().startswith('/addad')))
+async def admin_add_ad_fallback(message: types.Message, state: FSMContext):
+    import logging
+    logging.info("Fallback /addad handler triggered by %s (%s) text: %s", message.from_user.id, message.from_user.full_name, message.text)
+    try:
+        await message.reply("Reklama qo'shish jarayoni boshlandi (fallback)...")
+        await admin_add_ad_start(message, state)
+    except Exception:
+        logging.exception("Error in admin_add_ad_fallback")
+        try:
+            await message.reply("Xatolik yuz berdi: addad (fallback).")
+        except Exception:
+            pass
+
+
+# Command wrappers for admin keyboard commands -> reuse existing handlers
+@dp.message(Command(commands=["sections"]))
+async def cmd_sections(message: types.Message):
+    await manage_sections(message)
+
+@dp.message(F.text == "/sections")
+async def cmd_sections_text(message: types.Message):
+    await manage_sections(message)
+
+@dp.message(Command(commands=["addgroup"]))
+async def cmd_addgroup(message: types.Message, state: FSMContext):
+    await add_group_start(message, state)
+
+@dp.message(F.text == "/addgroup")
+async def cmd_addgroup_text(message: types.Message, state: FSMContext):
+    await add_group_start(message, state)
+
+@dp.message(Command(commands=["groupslist"]))
+async def cmd_groupslist(message: types.Message):
+    await show_groups(message)
+
+@dp.message(F.text == "/groupslist")
+async def cmd_groupslist_text(message: types.Message):
+    await show_groups(message)
+
+@dp.message(Command(commands=["exit"]))
+async def cmd_exit(message: types.Message):
+    await admin_exit(message)
+
+@dp.message(F.text == "/exit")
+async def cmd_exit_text(message: types.Message):
+    await admin_exit(message)
+
+
+@dp.message(Command(commands=["delgroup"]))
+async def cmd_delgroup(message: types.Message):
+    await show_groups_for_deletion(message)
+
+@dp.message(F.text == "/delgroup")
+async def cmd_delgroup_text(message: types.Message):
+    await show_groups_for_deletion(message)
+
+
 @dp.message(Command(commands=["admin"]))
 async def cmd_admin(message: types.Message):
     """Open admin panel if user is admin."""
@@ -234,13 +350,21 @@ async def admin_add_ad_start(message: types.Message, state: FSMContext):
         if message.from_user.id not in ADMIN_IDS:
             await message.reply("Bu admin panel. Sizda ruxsat yo'q.")
             return
-    sections = await get_sections()
-    kb = InlineKeyboardMarkup(row_width=1)
+    import logging
+    logging.info("admin_add_ad_start invoked by %s (%s)", message.from_user.id, getattr(message.from_user, 'full_name', ''))
+    try:
+        sections = await get_sections()
+    except Exception:
+        logging.exception("Failed to load sections in admin_add_ad_start")
+        await message.reply("Serverda xatolik bor — bo'limlarni yuklab bo'lmadi.")
+        return
+    rows = []
     if sections:
         for s in sections:
-            kb.add(InlineKeyboardButton(text=f"{s[1]} (id:{s[0]})", callback_data=f"choose_section:{s[0]}"))
-    kb.add(InlineKeyboardButton(text="➕ Yangi bo'lim qo'shish", callback_data="add_section"))
-    kb.add(InlineKeyboardButton(text="↩️ Bekor qilish", callback_data="cancel"))
+            rows.append([InlineKeyboardButton(text=f"{s[1]} (id:{s[0]})", callback_data=f"choose_section:{s[0]}")])
+    rows.append([InlineKeyboardButton(text="➕ Yangi bo'lim qo'shish", callback_data="add_section")])
+    rows.append([InlineKeyboardButton(text="↩️ Bekor qilish", callback_data="cancel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await message.answer("Bo‘lim tanlang yoki yangi bo‘lim yarating:", reply_markup=kb)
     await state.clear()
 
@@ -309,13 +433,14 @@ async def receive_ad_content(message: types.Message, state: FSMContext):
         return
 
     # Inline keyboard: har bir guruh uchun toggle (biz toggle ni state da ro'yxat bilan saqlaymiz)
-    kb = InlineKeyboardMarkup(row_width=1)
+    rows = []
     for g in groups:
         gid, tg_id, link, name, order = g
         label = f"{order}. {name or tg_id} ({tg_id})"
-        kb.add(InlineKeyboardButton(text=label, callback_data=f"toggle_group:{gid}"))
-    kb.add(InlineKeyboardButton(text="✅ Tanlovni yakunlash", callback_data="finish_group_selection"))
-    kb.add(InlineKeyboardButton(text="↩️ Bekor qilish", callback_data="cancel"))
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"toggle_group:{gid}")])
+    rows.append([InlineKeyboardButton(text="✅ Tanlovni yakunlash", callback_data="finish_group_selection")])
+    rows.append([InlineKeyboardButton(text="↩️ Bekor qilish", callback_data="cancel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     # initialize chosen list
     await state.update_data(chosen_groups=[])
     await message.answer("Qaysi guruhlarga yuborilsin? (Tugmalardan kerakli guruhlarni tanlang, so'ng ✅ bosing)", reply_markup=kb)
@@ -474,6 +599,47 @@ async def show_groups(message: types.Message):
         text += f"{g[4]}. {g[3] or g[1]} — {g[1]} — link: {g[2] or 'N/A'}\n"
     await message.answer(text)
 
+
+async def show_groups_for_deletion(message: types.Message):
+    """Show groups as inline buttons where each button deletes that group when pressed."""
+    try:
+        if not await is_admin(message.from_user.id):
+            await message.reply("Faqat adminlar uchun.")
+            return
+    except Exception:
+        if message.from_user.id not in ADMIN_IDS:
+            await message.reply("Faqat adminlar uchun.")
+            return
+    groups = await get_groups()
+    if not groups:
+        await message.answer("Hozircha hech qanday guruh qo'shilmagan.")
+        return
+    rows = []
+    for g in groups:
+        gid, tg_id, link, name, order = g
+        label = f"{order}. {name or tg_id} — {tg_id}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"delete_group:{gid}")])
+    rows.append([InlineKeyboardButton(text="↩️ Bekor qilish", callback_data="cancel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await message.answer("O'chirmoqchi bo'lgan guruhni tanlang:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("delete_group:"))
+async def callback_delete_group(cb: types.CallbackQuery):
+    await cb.answer()
+    try:
+        gid = int(cb.data.split(":")[1])
+    except Exception:
+        await cb.message.answer("Noto'g'ri guruh identifikatori.")
+        return
+    await delete_group(gid)
+    try:
+        # try removing inline keyboard from the original message
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await cb.message.answer(f"Guruh id={gid} muvaffaqiyatli o'chirildi.")
+
 # ====== Bo'limlarni boshqarish (ko'rish, o'chirish) ======
 @dp.message(F.text == "🗂 Bo'limlarni boshqarish")
 async def manage_sections(message: types.Message):
@@ -489,10 +655,11 @@ async def manage_sections(message: types.Message):
     if not sections:
         await message.answer("Bo'limlar yo'q. Yangi bo'lim qo'shish uchun '🔸 Reklama qo'shish' orqali yoki '➕ Guruh qo'shish' orqali ishlating.")
         return
-    kb = InlineKeyboardMarkup(row_width=1)
+    rows = []
     for s in sections:
-        kb.add(InlineKeyboardButton(text=f"📝 {s[1]} (id:{s[0]})", callback_data=f"section_view:{s[0]}"))
-    kb.add(InlineKeyboardButton(text="↩️ Orqaga", callback_data="cancel"))
+        rows.append([InlineKeyboardButton(text=f"📝 {s[1]} (id:{s[0]})", callback_data=f"section_view:{s[0]}")])
+    rows.append([InlineKeyboardButton(text="↩️ Orqaga", callback_data="cancel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await message.answer("Bo'limlarni boshqarish:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("section_view:"))
